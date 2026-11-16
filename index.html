@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SENTINEL // Console IA</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #05080d;
+      --panel: #0a1018;
+      --panel-2: #0e1621;
+      --line: #16324a;
+      --line-soft: #102233;
+      --text: #c9e4f5;
+      --muted: #5f7d94;
+      --cyan: #00e5ff;
+      --green: #39ff88;
+      --amber: #ffb000;
+      --red: #ff3b5c;
+      --magenta: #ff4fd8;
+      --glow-cyan: 0 0 8px rgba(0, 229, 255, .55);
+      --glow-green: 0 0 8px rgba(57, 255, 136, .55);
+      --radius: 6px;
+      --font: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.5;
+      overflow: hidden;
+    }
+    /* Grille de fond + lignes de balayage façon écran de supervision */
+    body::before {
+      content: "";
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(0, 229, 255, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 229, 255, .035) 1px, transparent 1px);
+      background-size: 32px 32px;
+      pointer-events: none; z-index: 0;
+    }
+    body::after {
+      content: "";
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(to bottom, rgba(255,255,255,.018) 0 1px, transparent 1px 3px);
+      pointer-events: none; z-index: 50;
+    }
+    button, input, select, textarea { font-family: inherit; font-size: inherit; color: inherit; }
+
+    /* ---------- Barre supérieure ---------- */
+    header.topbar {
+      position: relative; z-index: 1;
+      display: flex; align-items: center; gap: 18px;
+      height: 52px; padding: 0 18px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #08111b, #060b12);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: .18em; color: var(--cyan); text-shadow: var(--glow-cyan); }
+    .brand svg { filter: drop-shadow(0 0 4px var(--cyan)); }
+    .brand small { color: var(--muted); font-weight: 400; letter-spacing: .1em; text-shadow: none; }
+    .status-strip { display: flex; gap: 16px; margin-left: auto; flex-wrap: wrap; }
+    .led { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .led i { width: 8px; height: 8px; border-radius: 50%; background: #2a3a48; display: inline-block; }
+    .led.ok i { background: var(--green); box-shadow: var(--glow-green); }
+    .led.warn i { background: var(--amber); box-shadow: 0 0 8px rgba(255,176,0,.6); }
+    .led.err i { background: var(--red); box-shadow: 0 0 8px rgba(255,59,92,.6); }
+    .led.busy i { background: var(--cyan); box-shadow: var(--glow-cyan); animation: blink .8s infinite; }
+    .clock { color: var(--cyan); font-variant-numeric: tabular-nums; }
+    @keyframes blink { 50% { opacity: .25; } }
+
+    /* ---------- Disposition générale ---------- */
+    main.grid {
+      position: relative; z-index: 1;
+      display: grid;
+      grid-template-columns: 300px 1fr 300px;
+      gap: 12px; padding: 12px;
+      height: calc(100% - 52px);
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      display: flex; flex-direction: column;
+      min-height: 0;
+      position: relative;
+    }
+    .panel::before { /* coins lumineux */
+      content: ""; position: absolute; inset: -1px; border-radius: var(--radius); pointer-events: none;
+      background:
+        linear-gradient(var(--cyan), var(--cyan)) top left / 14px 1px no-repeat,
+        linear-gradient(var(--cyan), var(--cyan)) top left / 1px 14px no-repeat,
+        linear-gradient(var(--cyan), var(--cyan)) bottom right / 14px 1px no-repeat,
+        linear-gradient(var(--cyan), var(--cyan)) bottom right / 1px 14px no-repeat;
+      opacity: .8;
+    }
+    .panel-title {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 9px 12px; border-bottom: 1px solid var(--line-soft);
+      font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--cyan);
+    }
+    .panel-title span.tag { color: var(--muted); letter-spacing: .06em; }
+    .panel-body { padding: 12px; overflow: auto; min-height: 0; }
+    .col { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+
+    /* ---------- Formulaire de connexion ---------- */
+    label.field { display: block; margin-bottom: 10px; }
+    label.field > span { display: block; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+    .input, select.input, textarea.input {
+      width: 100%; padding: 8px 10px;
+      background: #050a10; border: 1px solid var(--line); border-radius: 4px;
+      color: var(--text); outline: none;
+    }
+    .input:focus { border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+    .row { display: flex; gap: 6px; }
+    .row > .input { flex: 1; min-width: 0; }
+    .check { display: flex; gap: 8px; align-items: flex-start; font-size: 11px; color: var(--muted); margin: 6px 0 12px; }
+    .check input { margin-top: 2px; accent-color: var(--cyan); }
+    .btn {
+      padding: 8px 12px; border-radius: 4px; cursor: pointer;
+      border: 1px solid var(--cyan); background: rgba(0, 229, 255, .08); color: var(--cyan);
+      text-transform: uppercase; letter-spacing: .12em; font-size: 11px; font-weight: 600;
+      transition: background .15s, box-shadow .15s;
+    }
+    .btn:hover:not(:disabled) { background: rgba(0, 229, 255, .18); box-shadow: var(--glow-cyan); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn.full { width: 100%; }
+    .btn.ghost { border-color: var(--line); color: var(--muted); background: transparent; }
+    .btn.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--muted); box-shadow: none; }
+    .btn.danger { border-color: var(--red); color: var(--red); background: rgba(255, 59, 92, .07); }
+    .btn.danger:hover:not(:disabled) { background: rgba(255, 59, 92, .16); box-shadow: 0 0 8px rgba(255,59,92,.5); }
+    .btn.small { padding: 4px 8px; font-size: 10px; }
+    .hint { font-size: 11px; color: var(--muted); margin: 4px 0 10px; }
+    .hint.warn { color: var(--amber); }
+    .hint a { color: var(--cyan); }
+
+    .session-card { border: 1px dashed var(--line); border-radius: 4px; padding: 10px; margin-top: 4px; font-size: 12px; }
+    .session-card dt { color: var(--muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+    .session-card dd { margin: 0 0 6px; color: var(--green); word-break: break-all; }
+
+    /* ---------- Indicateurs ---------- */
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .metric { background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: 4px; padding: 8px 10px; }
+    .metric b { display: block; font-size: 20px; color: var(--green); text-shadow: var(--glow-green); font-variant-numeric: tabular-nums; }
+    .metric small { color: var(--muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+    .spark { height: 36px; margin-top: 10px; display: flex; align-items: flex-end; gap: 2px; }
+    .spark i { flex: 1; background: linear-gradient(180deg, var(--cyan), rgba(0,229,255,.15)); min-height: 2px; border-radius: 1px 1px 0 0; }
+
+    /* ---------- Conversation ---------- */
+    .chat-panel { min-height: 0; }
+    #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+    .msg { max-width: 88%; border-radius: 4px; padding: 10px 12px; border: 1px solid var(--line-soft); background: var(--panel-2); white-space: pre-wrap; word-wrap: break-word; }
+    .msg header { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; margin-bottom: 6px; display: flex; gap: 10px; color: var(--muted); }
+    .msg.user { align-self: flex-end; border-color: rgba(255, 79, 216, .35); }
+    .msg.user header b { color: var(--magenta); }
+    .msg.assistant { align-self: flex-start; border-color: rgba(57, 255, 136, .3); }
+    .msg.assistant header b { color: var(--green); }
+    .msg.system { align-self: center; max-width: 100%; border-style: dashed; color: var(--muted); font-size: 12px; text-align: center; }
+    .msg.error { align-self: center; border-color: var(--red); color: var(--red); background: rgba(255, 59, 92, .06); }
+    .msg pre { background: #03060a; border: 1px solid var(--line); border-radius: 4px; padding: 10px; overflow-x: auto; white-space: pre; margin: 8px 0; color: var(--green); }
+    .msg code { background: #03060a; padding: 1px 4px; border-radius: 3px; color: var(--amber); }
+    .msg pre code { background: none; padding: 0; color: inherit; }
+    .typing::after { content: "▋"; color: var(--green); animation: blink .7s infinite; }
+
+    .composer { border-top: 1px solid var(--line-soft); padding: 10px; display: flex; gap: 8px; align-items: flex-end; }
+    .composer textarea { flex: 1; resize: none; min-height: 42px; max-height: 160px; }
+    .prompt-sign { color: var(--green); padding: 10px 0 0 2px; text-shadow: var(--glow-green); }
+
+    /* ---------- Journal & historique ---------- */
+    #log { font-size: 11px; line-height: 1.6; }
+    #log div { white-space: pre-wrap; word-break: break-word; }
+    #log .t { color: var(--muted); }
+    #log .info { color: var(--cyan); }
+    #log .ok { color: var(--green); }
+    #log .warn { color: var(--amber); }
+    #log .err { color: var(--red); }
+    #history { list-style: none; margin: 0; padding: 0; }
+    #history li { padding: 7px 8px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; display: flex; justify-content: space-between; gap: 6px; align-items: center; }
+    #history li:hover { border-color: var(--line); background: var(--panel-2); }
+    #history li.active { border-color: var(--cyan); background: rgba(0, 229, 255, .06); }
+    #history li .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+    #history li .del { color: var(--muted); background: none; border: none; cursor: pointer; padding: 0 4px; }
+    #history li .del:hover { color: var(--red); }
+    .empty { color: var(--muted); font-size: 11px; font-style: italic; }
+
+    .hidden { display: none !important; }
+
+    /* ---------- Responsive ---------- */
+    @media (max-width: 1100px) {
+      main.grid { grid-template-columns: 280px 1fr; }
+      .col.right { display: none; }
+    }
+    @media (max-width: 760px) {
+      body { overflow: auto; }
+      main.grid { grid-template-columns: 1fr; height: auto; padding: 8px; }
+      .chat-panel { height: 75vh; }
+      .status-strip { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+        <path d="M12 2 3 6v6c0 5 3.8 9.4 9 10 5.2-.6 9-5 9-10V6l-9-4Z" />
+        <path d="m8.5 12 2.5 2.5 4.5-5" />
+      </svg>
+      SENTINEL <small>// CONSOLE IA GÉNÉRATIVE</small>
+    </div>
+    <div class="status-strip">
+      <span class="led" id="led-db"><i></i>Base</span>
+      <span class="led" id="led-auth"><i></i>Auth</span>
+      <span class="led" id="led-llm"><i></i>Modèle</span>
+      <span class="clock" id="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- ===== Colonne gauche : connexion + indicateurs ===== -->
+    <section class="col">
+      <div class="panel">
+        <div class="panel-title">Accès fournisseur <span class="tag" id="conn-tag">HORS LIGNE</span></div>
+        <div class="panel-body">
+          <!-- Formulaire affiché tant que la personne n'est pas connectée -->
+          <form id="login-form" autocomplete="off">
+            <label class="field"><span>Fournisseur LLM</span>
+              <select id="provider" class="input"></select>
+            </label>
+            <div id="custom-url-wrap" class="hidden">
+              <label class="field"><span>URL de base (compatible OpenAI)</span>
+                <input id="custom-url" class="input" placeholder="https://exemple.com/v1" />
+              </label>
+            </div>
+            <label class="field"><span>Clé API</span>
+              <input id="api-key" class="input" type="password" placeholder="sk-..." required />
+            </label>
+            <p class="hint" id="key-hint"></p>
+            <label class="field"><span>Modèle</span>
+              <div class="row">
+                <input id="model" class="input" list="model-list" placeholder="nom du modèle" required />
+                <button type="button" class="btn small ghost" id="btn-models" title="Interroger le fournisseur">Lister</button>
+              </div>
+              <datalist id="model-list"></datalist>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="remember" />
+              <span>Garder la clé pour cet onglet (sessionStorage, effacée à la fermeture). Sinon, elle reste seulement en mémoire.</span>
+            </label>
+            <button type="submit" class="btn full" id="btn-connect">Établir la liaison</button>
+          </form>
+
+          <!-- Carte affichée une fois connecté -->
+          <div id="session-view" class="hidden">
+            <dl class="session-card">
+              <dt>Fournisseur</dt><dd id="s-provider"></dd>
+              <dt>Modèle</dt><dd id="s-model"></dd>
+              <dt>Clé</dt><dd id="s-key"></dd>
+              <dt>Stockage de la clé</dt><dd id="s-storage"></dd>
+            </dl>
+            <div class="row" style="margin-top:10px">
+              <button class="btn ghost full" id="btn-edit">Modifier</button>
+              <button class="btn danger full" id="btn-logout">Couper</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Télémétrie <span class="tag">SESSION</span></div>
+        <div class="panel-body">
+          <div class="metrics">
+            <div class="metric"><b id="m-req">0</b><small>Requêtes</small></div>
+            <div class="metric"><b id="m-lat">–</b><small>Latence ms</small></div>
+            <div class="metric"><b id="m-tok">0</b><small>Jetons</small></div>
+            <div class="metric"><b id="m-err">0</b><small>Erreurs</small></div>
+          </div>
+          <div class="spark" id="spark" aria-label="Historique des latences"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Colonne centrale : conversation ===== -->
+    <section class="panel chat-panel">
+      <div class="panel-title">
+        Canal de conversation
+        <span class="tag" id="conv-tag">NOUVELLE SESSION</span>
+      </div>
+      <div id="messages"></div>
+      <form class="composer" id="composer">
+        <span class="prompt-sign">&gt;_</span>
+        <textarea id="prompt" class="input" rows="1" placeholder="Connectez un fournisseur pour commencer…" disabled></textarea>
+        <button class="btn" id="btn-send" type="submit" disabled>Envoyer</button>
+      </form>
+    </section>
+
+    <!-- ===== Colonne droite : historique + journal ===== -->
+    <section class="col right">
+      <div class="panel" style="flex: 1; min-height: 0;">
+        <div class="panel-title">
+          Archives
+          <button class="btn small ghost" id="btn-new" type="button">+ Nouvelle</button>
+        </div>
+        <div class="panel-body">
+          <ul id="history"></ul>
+          <p class="empty" id="history-empty">Aucune conversation archivée.</p>
+        </div>
+      </div>
+      <div class="panel" style="flex: 1; min-height: 0;">
+        <div class="panel-title">Journal d'événements <span class="tag">LIVE</span></div>
+        <div class="panel-body" id="log"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- La configuration Firebase est importée par app.js (modules ES). -->
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,767 @@
+/* =====================================================================
+   SENTINEL // Console IA générative
+   ---------------------------------------------------------------------
+   Rôle de ce fichier :
+     1. Décrire les fournisseurs LLM disponibles (Groq, OpenAI, ...).
+     2. Gérer la clé API de l'utilisateur SANS JAMAIS l'envoyer à Firebase.
+     3. Appeler le modèle choisi et afficher la conversation.
+     4. Archiver l'historique des conversations dans Firestore (par uid).
+
+   Règle d'or : la clé API vit uniquement dans le navigateur
+   (variable en mémoire, ou sessionStorage si la case est cochée).
+   Elle part seulement vers le fournisseur LLM choisi, jamais ailleurs.
+   ===================================================================== */
+
+import { firebaseConfig } from "./firebase-config.js";
+
+/* ---------------------------------------------------------------------
+   1. Paramètres généraux
+   --------------------------------------------------------------------- */
+const FIREBASE_SDK = "https://www.gstatic.com/firebasejs/10.12.2";
+const SYSTEM_PROMPT =
+  "Tu es SENTINEL, un assistant pédagogique. Réponds en français, de façon claire et structurée. " +
+  "Si on te demande quelque chose de dangereux ou d'illégal, refuse poliment.";
+const MAX_CONTEXT_MESSAGES = 20;   // nombre de messages renvoyés au modèle à chaque tour
+const MAX_STORED_CHARS = 30000;    // doit rester cohérent avec firestore.rules
+const KEY_STORAGE = "sentinel.apiKey";      // sessionStorage (optionnel)
+const PREFS_STORAGE = "sentinel.prefs";     // localStorage : fournisseur + modèle (rien de secret)
+
+/* ---------------------------------------------------------------------
+   2. Catalogue des fournisseurs
+   type "openai"    : API compatible OpenAI (/chat/completions)
+   type "anthropic" : API Messages d'Anthropic (format différent)
+   cors : true = appel direct depuis le navigateur accepté
+          "header" = accepté avec un en-tête spécial
+          "?" = non garanti, à tester
+   --------------------------------------------------------------------- */
+const PROVIDERS = {
+  groq: {
+    label: "Groq",
+    type: "openai",
+    baseUrl: "https://api.groq.com/openai/v1",
+    defaultModel: "llama-3.3-70b-versatile",
+    keyPrefix: "gsk_",
+    keyUrl: "https://console.groq.com/keys",
+    cors: true,
+  },
+  openai: {
+    label: "OpenAI",
+    type: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    defaultModel: "gpt-4o-mini",
+    keyPrefix: "sk-",
+    keyUrl: "https://platform.openai.com/api-keys",
+    cors: true,
+  },
+  openrouter: {
+    label: "OpenRouter",
+    type: "openai",
+    baseUrl: "https://openrouter.ai/api/v1",
+    defaultModel: "openai/gpt-4o-mini",
+    keyPrefix: "sk-or-",
+    keyUrl: "https://openrouter.ai/keys",
+    cors: true,
+  },
+  mistral: {
+    label: "Mistral AI",
+    type: "openai",
+    baseUrl: "https://api.mistral.ai/v1",
+    defaultModel: "mistral-small-latest",
+    keyPrefix: "",
+    keyUrl: "https://console.mistral.ai/api-keys",
+    cors: "?",
+  },
+  gemini: {
+    label: "Google Gemini (compatible OpenAI)",
+    type: "openai",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    defaultModel: "gemini-2.5-flash",
+    keyPrefix: "AIza",
+    keyUrl: "https://aistudio.google.com/apikey",
+    cors: "?",
+  },
+  anthropic: {
+    label: "Anthropic (Claude)",
+    type: "anthropic",
+    baseUrl: "https://api.anthropic.com/v1",
+    defaultModel: "claude-haiku-5-5",
+    keyPrefix: "sk-ant-",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+    cors: "header",
+  },
+  custom: {
+    label: "Autre (URL compatible OpenAI)",
+    type: "openai",
+    baseUrl: "",
+    defaultModel: "",
+    keyPrefix: "",
+    keyUrl: "",
+    cors: "?",
+  },
+};
+
+/* ---------------------------------------------------------------------
+   3. État de l'application (tout est en mémoire)
+   --------------------------------------------------------------------- */
+const state = {
+  providerId: "groq",
+  model: "",
+  customUrl: "",
+  apiKey: null,          // <- la clé : uniquement ici (et éventuellement sessionStorage)
+  remember: false,
+  messages: [],          // conversation courante [{role, content}]
+  convId: null,          // id Firestore de la conversation courante
+  busy: false,
+  metrics: { req: 0, tok: 0, err: 0, lat: [] },
+  fb: null,              // { db, uid, fs } une fois Firebase prêt
+};
+
+/* ---------------------------------------------------------------------
+   4. Raccourcis DOM
+   --------------------------------------------------------------------- */
+const $ = (id) => document.getElementById(id);
+const ui = {
+  provider: $("provider"), apiKey: $("api-key"), model: $("model"), modelList: $("model-list"),
+  customWrap: $("custom-url-wrap"), customUrl: $("custom-url"), remember: $("remember"),
+  keyHint: $("key-hint"), loginForm: $("login-form"), sessionView: $("session-view"),
+  sProvider: $("s-provider"), sModel: $("s-model"), sKey: $("s-key"), sStorage: $("s-storage"),
+  connTag: $("conn-tag"), convTag: $("conv-tag"),
+  messages: $("messages"), composer: $("composer"), prompt: $("prompt"), send: $("btn-send"),
+  history: $("history"), historyEmpty: $("history-empty"), log: $("log"),
+  ledDb: $("led-db"), ledAuth: $("led-auth"), ledLlm: $("led-llm"),
+};
+
+/* ---------------------------------------------------------------------
+   5. Journal d'événements (panneau "terminal")
+   --------------------------------------------------------------------- */
+function log(text, level = "info") {
+  const line = document.createElement("div");
+  const t = document.createElement("span");
+  t.className = "t";
+  t.textContent = `[${new Date().toLocaleTimeString("fr-FR")}] `;
+  const m = document.createElement("span");
+  m.className = level;
+  m.textContent = text;
+  line.append(t, m);
+  ui.log.append(line);
+  ui.log.scrollTop = ui.log.scrollHeight;
+}
+
+function setLed(el, status) {
+  el.classList.remove("ok", "warn", "err", "busy");
+  if (status) el.classList.add(status);
+}
+
+/* ---------------------------------------------------------------------
+   6. Affichage des messages (sans innerHTML : protection contre le XSS)
+   La réponse du modèle est du texte non fiable. On ne l'injecte jamais
+   comme HTML : on construit les éléments et on utilise textContent.
+   --------------------------------------------------------------------- */
+function renderRichText(container, text) {
+  // Découpe les blocs ```code``` puis les `code` en ligne.
+  const parts = text.split(/```(?:[\w+-]*)\n?([\s\S]*?)```/g);
+  parts.forEach((part, i) => {
+    if (i % 2 === 1) {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = part.replace(/\n$/, "");
+      pre.append(code);
+      container.append(pre);
+    } else {
+      if (i > 0) part = part.replace(/^\n/, ""); // évite une ligne vide après un bloc de code
+      part.split(/`([^`\n]+)`/g).forEach((chunk, j) => {
+        if (j % 2 === 1) {
+          const c = document.createElement("code");
+          c.textContent = chunk;
+          container.append(c);
+        } else if (chunk) {
+          container.append(document.createTextNode(chunk));
+        }
+      });
+    }
+  });
+}
+
+function addMessage(role, content, meta = "") {
+  const el = document.createElement("div");
+  el.className = `msg ${role}`;
+  if (role === "user" || role === "assistant") {
+    const h = document.createElement("header");
+    const who = document.createElement("b");
+    who.textContent = role === "user" ? "Opérateur" : "Modèle";
+    const info = document.createElement("span");
+    info.textContent = meta || new Date().toLocaleTimeString("fr-FR");
+    h.append(who, info);
+    el.append(h);
+  }
+  const body = document.createElement("div");
+  renderRichText(body, content);
+  el.append(body);
+  ui.messages.append(el);
+  ui.messages.scrollTop = ui.messages.scrollHeight;
+  return { el, body };
+}
+
+function clearMessages() {
+  ui.messages.replaceChildren();
+}
+
+function welcome() {
+  addMessage(
+    "system",
+    "Bienvenue dans SENTINEL. Choisissez un fournisseur, collez votre clé API et établissez la liaison.\n" +
+      "Votre clé reste dans ce navigateur : elle n'est jamais enregistrée dans la base de données."
+  );
+}
+
+/* ---------------------------------------------------------------------
+   7. Télémétrie
+   --------------------------------------------------------------------- */
+function renderMetrics() {
+  const m = state.metrics;
+  $("m-req").textContent = m.req;
+  $("m-tok").textContent = m.tok.toLocaleString("fr-FR");
+  $("m-err").textContent = m.err;
+  $("m-lat").textContent = m.lat.length ? m.lat[m.lat.length - 1] : "–";
+  const spark = $("spark");
+  spark.replaceChildren();
+  const max = Math.max(...m.lat, 1);
+  m.lat.slice(-24).forEach((v) => {
+    const bar = document.createElement("i");
+    bar.style.height = `${Math.max(6, (v / max) * 100)}%`;
+    bar.title = `${v} ms`;
+    spark.append(bar);
+  });
+}
+
+/* ---------------------------------------------------------------------
+   8. Formulaire de connexion au fournisseur
+   --------------------------------------------------------------------- */
+function fillProviderSelect() {
+  for (const [id, p] of Object.entries(PROVIDERS)) {
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = p.label;
+    ui.provider.append(opt);
+  }
+}
+
+function currentProvider() {
+  return PROVIDERS[state.providerId];
+}
+
+function baseUrl() {
+  const p = currentProvider();
+  return (state.providerId === "custom" ? state.customUrl : p.baseUrl).replace(/\/+$/, "");
+}
+
+function updateProviderHint() {
+  const id = ui.provider.value;
+  const p = PROVIDERS[id];
+  ui.customWrap.classList.toggle("hidden", id !== "custom");
+  ui.model.placeholder = p.defaultModel || "nom du modèle";
+  ui.keyHint.className = "hint";
+  ui.keyHint.replaceChildren();
+
+  if (p.keyUrl) {
+    const a = document.createElement("a");
+    a.href = p.keyUrl;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = "Obtenir une clé";
+    ui.keyHint.append(a);
+  }
+  let note = "";
+  if (p.cors === "header") note = " · Appel direct autorisé via un en-tête spécial (voir README).";
+  if (p.cors === "?") {
+    note = " · Appel direct depuis le navigateur non garanti (CORS).";
+    ui.keyHint.className = "hint warn";
+  }
+  ui.keyHint.append(document.createTextNode(note));
+}
+
+function maskKey(key) {
+  if (!key) return "";
+  if (key.length <= 10) return "•".repeat(key.length);
+  return `${key.slice(0, 4)}${"•".repeat(8)}${key.slice(-4)}`;
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem(
+      PREFS_STORAGE,
+      JSON.stringify({ providerId: state.providerId, model: state.model, customUrl: state.customUrl })
+    );
+  } catch { /* stockage indisponible : sans gravité */ }
+}
+
+function loadPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem(PREFS_STORAGE) || "null");
+    if (p && PROVIDERS[p.providerId]) {
+      state.providerId = p.providerId;
+      state.model = p.model || "";
+      state.customUrl = p.customUrl || "";
+    }
+  } catch { /* ignoré */ }
+}
+
+function showConnected(connected) {
+  ui.loginForm.classList.toggle("hidden", connected);
+  ui.sessionView.classList.toggle("hidden", !connected);
+  ui.prompt.disabled = !connected;
+  ui.send.disabled = !connected;
+  ui.prompt.placeholder = connected
+    ? "Saisissez votre message… (Entrée pour envoyer, Maj+Entrée pour aller à la ligne)"
+    : "Connectez un fournisseur pour commencer…";
+  ui.connTag.textContent = connected ? "EN LIGNE" : "HORS LIGNE";
+  setLed(ui.ledLlm, connected ? "ok" : null);
+  if (connected) {
+    ui.sProvider.textContent = currentProvider().label;
+    ui.sModel.textContent = state.model;
+    ui.sKey.textContent = maskKey(state.apiKey);
+    ui.sStorage.textContent = state.remember ? "sessionStorage (cet onglet)" : "mémoire uniquement";
+    ui.prompt.focus();
+  }
+}
+
+function connect(e) {
+  e.preventDefault();
+  const key = ui.apiKey.value.trim();
+  const model = ui.model.value.trim() || PROVIDERS[ui.provider.value].defaultModel;
+  if (!key) return log("Clé API manquante.", "warn");
+  if (!model) return log("Indiquez un nom de modèle.", "warn");
+  if (ui.provider.value === "custom" && !/^https:\/\//.test(ui.customUrl.value.trim())) {
+    return log("L'URL personnalisée doit commencer par https://", "warn");
+  }
+
+  state.providerId = ui.provider.value;
+  state.model = model;
+  state.customUrl = ui.customUrl.value.trim();
+  state.apiKey = key;
+  state.remember = ui.remember.checked;
+
+  try {
+    if (state.remember) sessionStorage.setItem(KEY_STORAGE, key);
+    else sessionStorage.removeItem(KEY_STORAGE);
+  } catch { /* ignoré */ }
+
+  const p = currentProvider();
+  if (p.keyPrefix && !key.startsWith(p.keyPrefix)) {
+    log(`Attention : une clé ${p.label} commence en général par « ${p.keyPrefix} ».`, "warn");
+  }
+  savePrefs();
+  showConnected(true);
+  log(`Liaison établie avec ${p.label} (modèle ${model}).`, "ok");
+}
+
+function logout() {
+  state.apiKey = null;
+  ui.apiKey.value = "";
+  try { sessionStorage.removeItem(KEY_STORAGE); } catch { /* ignoré */ }
+  showConnected(false);
+  log("Liaison coupée. Clé effacée du navigateur.", "warn");
+}
+
+function editConnection() {
+  ui.provider.value = state.providerId;
+  ui.model.value = state.model;
+  ui.customUrl.value = state.customUrl;
+  ui.apiKey.value = state.apiKey || "";
+  ui.remember.checked = state.remember;
+  updateProviderHint();
+  showConnected(false);
+}
+
+/* ---------------------------------------------------------------------
+   9. Appels aux fournisseurs LLM
+   --------------------------------------------------------------------- */
+function buildRequest(history) {
+  const p = currentProvider();
+  if (p.type === "anthropic") {
+    return {
+      url: `${baseUrl()}/messages`,
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": state.apiKey,
+        "anthropic-version": "2023-06-01",
+        // Sans cet en-tête, Anthropic refuse les appels venant d'un navigateur.
+        // Son nom est volontairement inquiétant : voir le README.
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: { model: state.model, max_tokens: 1024, system: SYSTEM_PROMPT, messages: history },
+    };
+  }
+  return {
+    url: `${baseUrl()}/chat/completions`,
+    headers: { "content-type": "application/json", authorization: `Bearer ${state.apiKey}` },
+    body: {
+      model: state.model,
+      temperature: 0.7,
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
+    },
+  };
+}
+
+function parseResponse(data) {
+  if (currentProvider().type === "anthropic") {
+    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    const u = data.usage || {};
+    return { text, tokens: (u.input_tokens || 0) + (u.output_tokens || 0) };
+  }
+  const text = data.choices?.[0]?.message?.content ?? "";
+  return { text, tokens: data.usage?.total_tokens || 0 };
+}
+
+function explainError(status, detail) {
+  if (status === 401 || status === 403) return `Clé refusée (${status}). Vérifiez la clé et le fournisseur choisi.`;
+  if (status === 404) return `Ressource introuvable (404). Le nom du modèle est sans doute incorrect : utilisez « Lister ».`;
+  if (status === 429) return `Quota ou limite de débit atteint (429). Patientez ou vérifiez votre crédit.`;
+  if (status >= 500) return `Le fournisseur rencontre une erreur (${status}). Réessayez plus tard.`;
+  return `Erreur ${status} : ${detail}`;
+}
+
+async function callModel(history) {
+  const { url, headers, body } = buildRequest(history);
+  let res;
+  try {
+    res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  } catch (err) {
+    // fetch lève une TypeError sans détail quand le navigateur bloque la requête (CORS) ou sans réseau.
+    throw new Error(
+      "Requête bloquée avant d'atteindre le fournisseur. Causes probables : pas de connexion, " +
+        "ou le fournisseur refuse les appels directs depuis un navigateur (CORS). Voir le README."
+    );
+  }
+  const raw = await res.text();
+  let data = {};
+  try { data = JSON.parse(raw); } catch { /* réponse non JSON */ }
+  if (!res.ok) {
+    const detail = data?.error?.message || data?.message || raw.slice(0, 200);
+    throw new Error(explainError(res.status, detail));
+  }
+  return parseResponse(data);
+}
+
+async function listModels() {
+  const key = ui.apiKey.value.trim();
+  const id = ui.provider.value;
+  const p = PROVIDERS[id];
+  const base = (id === "custom" ? ui.customUrl.value.trim() : p.baseUrl).replace(/\/+$/, "");
+  if (!key || !base) return log("Renseignez d'abord la clé (et l'URL si besoin).", "warn");
+
+  const headers =
+    p.type === "anthropic"
+      ? { "x-api-key": key, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }
+      : { authorization: `Bearer ${key}` };
+  log(`Interrogation de ${p.label} : liste des modèles…`);
+  try {
+    const res = await fetch(`${base}/models`, { headers });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(explainError(res.status, data?.error?.message || ""));
+    const ids = (data.data || []).map((m) => m.id).sort();
+    ui.modelList.replaceChildren(
+      ...ids.map((mid) => Object.assign(document.createElement("option"), { value: mid }))
+    );
+    log(`${ids.length} modèles disponibles. Cliquez dans le champ « Modèle » pour choisir.`, "ok");
+  } catch (err) {
+    // TypeError = requête bloquée par le navigateur (CORS) ou absence de réseau.
+    log(err instanceof TypeError ? "Impossible de lister les modèles (CORS ou réseau)." : err.message, "err");
+  }
+}
+
+/* ---------------------------------------------------------------------
+   10. Envoi d'un message
+   --------------------------------------------------------------------- */
+async function send(e) {
+  e?.preventDefault();
+  const text = ui.prompt.value.trim();
+  if (!text || state.busy || !state.apiKey) return;
+
+  // Garde-fou pédagogique : empêcher de coller sa propre clé dans la conversation,
+  // car la conversation, elle, est archivée dans Firestore.
+  if (text.includes(state.apiKey)) {
+    log("Message bloqué : il contient votre clé API. Elle serait archivée dans la base.", "err");
+    return;
+  }
+
+  state.busy = true;
+  ui.send.disabled = true;
+  ui.prompt.value = "";
+  autoGrow();
+  addMessage("user", text);
+  state.messages.push({ role: "user", content: text });
+  await persistMessage("user", text);
+
+  const pending = addMessage("assistant", "");
+  pending.body.classList.add("typing");
+  setLed(ui.ledLlm, "busy");
+  log(`→ ${currentProvider().label} / ${state.model}`);
+
+  const t0 = performance.now();
+  try {
+    const history = state.messages.slice(-MAX_CONTEXT_MESSAGES);
+    const { text: answer, tokens } = await callModel(history);
+    const ms = Math.round(performance.now() - t0);
+    pending.body.classList.remove("typing");
+    renderRichText(pending.body, answer || "(réponse vide)");
+    pending.el.querySelector("header span").textContent = `${ms} ms · ${tokens || "?"} jetons`;
+    state.messages.push({ role: "assistant", content: answer });
+    state.metrics.req++;
+    state.metrics.tok += tokens;
+    state.metrics.lat.push(ms);
+    setLed(ui.ledLlm, "ok");
+    log(`← réponse reçue en ${ms} ms (${tokens || "?"} jetons)`, "ok");
+    await persistMessage("assistant", answer);
+  } catch (err) {
+    pending.el.remove();
+    state.messages.pop(); // on retire la question sans réponse du contexte
+    state.metrics.err++;
+    setLed(ui.ledLlm, "err");
+    addMessage("error", err.message);
+    log(err.message, "err");
+  } finally {
+    renderMetrics();
+    state.busy = false;
+    ui.send.disabled = false;
+    ui.prompt.focus();
+  }
+}
+
+function autoGrow() {
+  ui.prompt.style.height = "auto";
+  ui.prompt.style.height = `${Math.min(ui.prompt.scrollHeight, 160)}px`;
+}
+
+function newConversation() {
+  state.messages = [];
+  state.convId = null;
+  ui.convTag.textContent = "NOUVELLE SESSION";
+  clearMessages();
+  welcome();
+  markActiveHistory();
+}
+
+/* ---------------------------------------------------------------------
+   11. Firebase : authentification anonyme + historique Firestore
+   Structure :
+     users/{uid}/conversations/{convId}            -> titre, fournisseur, modèle, dates
+     users/{uid}/conversations/{convId}/messages/* -> role, content, createdAt
+   Aucun champ "clé API" n'existe ici, et firestore.rules refuse tout champ inconnu.
+   --------------------------------------------------------------------- */
+function firebaseConfigured() {
+  return (
+    firebaseConfig &&
+    typeof firebaseConfig.apiKey === "string" &&
+    firebaseConfig.apiKey.length > 10 &&
+    !firebaseConfig.apiKey.startsWith("VOTRE") &&
+    !String(firebaseConfig.projectId || "").startsWith("VOTRE")
+  );
+}
+
+async function initFirebase() {
+  if (!firebaseConfigured()) {
+    setLed(ui.ledDb, "warn");
+    setLed(ui.ledAuth, "warn");
+    log("Firebase non configuré : mode local, l'historique ne sera pas archivé. Remplissez firebase-config.js.", "warn");
+    renderHistory([]);
+    return;
+  }
+  try {
+    log("Chargement du SDK Firebase…");
+    const [{ initializeApp }, authMod, fs] = await Promise.all([
+      import(`${FIREBASE_SDK}/firebase-app.js`),
+      import(`${FIREBASE_SDK}/firebase-auth.js`),
+      import(`${FIREBASE_SDK}/firebase-firestore.js`),
+    ]);
+    const app = initializeApp(firebaseConfig);
+    const auth = authMod.getAuth(app);
+    const db = fs.getFirestore(app);
+    setLed(ui.ledDb, "ok");
+
+    authMod.onAuthStateChanged(auth, async (user) => {
+      if (!user) return;
+      state.fb = { db, uid: user.uid, fs };
+      setLed(ui.ledAuth, "ok");
+      log(`Authentifié (anonyme) · uid ${user.uid.slice(0, 8)}…`, "ok");
+      await loadHistory();
+    });
+    setLed(ui.ledAuth, "busy");
+    await authMod.signInAnonymously(auth);
+  } catch (err) {
+    setLed(ui.ledDb, "err");
+    setLed(ui.ledAuth, "err");
+    log(`Firebase indisponible : ${err.code || err.message}`, "err");
+    if (String(err.code).includes("admin-restricted-operation") || String(err.code).includes("operation-not-allowed")) {
+      log("→ Activez la connexion « Anonyme » dans Firebase > Authentication > Sign-in method.", "warn");
+    }
+    if (String(err.code).includes("unauthorized-domain")) {
+      log("→ Ajoutez ce domaine dans Authentication > Settings > Authorized domains.", "warn");
+    }
+  }
+}
+
+function convCollection() {
+  const { db, uid, fs } = state.fb;
+  return fs.collection(db, "users", uid, "conversations");
+}
+
+async function persistMessage(role, content) {
+  if (!state.fb) return;
+  const { fs } = state.fb;
+  try {
+    const safe = String(content).slice(0, MAX_STORED_CHARS);
+    if (!state.convId) {
+      const ref = await fs.addDoc(convCollection(), {
+        title: safe.replace(/\s+/g, " ").slice(0, 80),
+        provider: state.providerId,
+        model: state.model.slice(0, 120),
+        createdAt: fs.serverTimestamp(),
+        updatedAt: fs.serverTimestamp(),
+      });
+      state.convId = ref.id;
+      ui.convTag.textContent = `ARCHIVE ${ref.id.slice(0, 6).toUpperCase()}`;
+    } else {
+      await fs.updateDoc(fs.doc(convCollection(), state.convId), { updatedAt: fs.serverTimestamp() });
+    }
+    await fs.addDoc(fs.collection(convCollection(), state.convId, "messages"), {
+      role,
+      content: safe,
+      createdAt: fs.serverTimestamp(),
+    });
+    if (role === "user") loadHistory();
+  } catch (err) {
+    log(`Archivage impossible : ${err.code || err.message}`, "err");
+  }
+}
+
+async function loadHistory() {
+  if (!state.fb) return;
+  const { fs } = state.fb;
+  try {
+    const q = fs.query(convCollection(), fs.orderBy("updatedAt", "desc"), fs.limit(30));
+    const snap = await fs.getDocs(q);
+    renderHistory(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  } catch (err) {
+    log(`Lecture de l'historique impossible : ${err.code || err.message}`, "err");
+  }
+}
+
+function renderHistory(items) {
+  ui.history.replaceChildren();
+  ui.historyEmpty.classList.toggle("hidden", items.length > 0);
+  ui.historyEmpty.textContent = state.fb
+    ? "Aucune conversation archivée."
+    : "Archivage désactivé (Firebase non configuré).";
+  for (const c of items) {
+    const li = document.createElement("li");
+    li.dataset.id = c.id;
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = c.title || "(sans titre)";
+    title.title = `${PROVIDERS[c.provider]?.label || c.provider} · ${c.model}`;
+    const del = document.createElement("button");
+    del.className = "del";
+    del.type = "button";
+    del.title = "Supprimer";
+    del.textContent = "✕";
+    del.addEventListener("click", (ev) => { ev.stopPropagation(); deleteConversation(c.id); });
+    li.append(title, del);
+    li.addEventListener("click", () => openConversation(c.id, c.title));
+    ui.history.append(li);
+  }
+  markActiveHistory();
+}
+
+function markActiveHistory() {
+  for (const li of ui.history.children) li.classList.toggle("active", li.dataset.id === state.convId);
+}
+
+async function openConversation(id, title) {
+  if (!state.fb || state.busy) return;
+  const { fs } = state.fb;
+  try {
+    const q = fs.query(fs.collection(convCollection(), id, "messages"), fs.orderBy("createdAt", "asc"));
+    const snap = await fs.getDocs(q);
+    state.convId = id;
+    state.messages = snap.docs.map((d) => ({ role: d.data().role, content: d.data().content }));
+    clearMessages();
+    addMessage("system", `Archive rechargée : « ${title || id} »`);
+    for (const m of state.messages) addMessage(m.role, m.content, "archive");
+    ui.convTag.textContent = `ARCHIVE ${id.slice(0, 6).toUpperCase()}`;
+    markActiveHistory();
+    log(`Conversation ${id.slice(0, 6)} rechargée (${state.messages.length} messages).`, "info");
+  } catch (err) {
+    log(`Ouverture impossible : ${err.code || err.message}`, "err");
+  }
+}
+
+async function deleteConversation(id) {
+  if (!state.fb) return;
+  const { db, fs } = state.fb;
+  try {
+    const msgs = await fs.getDocs(fs.collection(convCollection(), id, "messages"));
+    const batch = fs.writeBatch(db);
+    msgs.forEach((d) => batch.delete(d.ref));
+    batch.delete(fs.doc(convCollection(), id));
+    await batch.commit();
+    log(`Conversation ${id.slice(0, 6)} supprimée.`, "warn");
+    if (state.convId === id) newConversation();
+    loadHistory();
+  } catch (err) {
+    log(`Suppression impossible : ${err.code || err.message}`, "err");
+  }
+}
+
+/* ---------------------------------------------------------------------
+   12. Démarrage
+   --------------------------------------------------------------------- */
+function tickClock() {
+  $("clock").textContent = new Date().toLocaleTimeString("fr-FR");
+}
+
+function init() {
+  fillProviderSelect();
+  loadPrefs();
+  ui.provider.value = state.providerId;
+  ui.model.value = state.model;
+  ui.customUrl.value = state.customUrl;
+  updateProviderHint();
+
+  ui.provider.addEventListener("change", () => {
+    ui.model.value = "";
+    ui.modelList.replaceChildren();
+    updateProviderHint();
+  });
+  ui.loginForm.addEventListener("submit", connect);
+  $("btn-models").addEventListener("click", listModels);
+  $("btn-logout").addEventListener("click", logout);
+  $("btn-edit").addEventListener("click", editConnection);
+  $("btn-new").addEventListener("click", newConversation);
+  ui.composer.addEventListener("submit", send);
+  ui.prompt.addEventListener("input", autoGrow);
+  ui.prompt.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+
+  tickClock();
+  setInterval(tickClock, 1000);
+  welcome();
+  renderMetrics();
+  log("SENTINEL initialisé.", "ok");
+
+  // Restauration éventuelle de la clé (seulement si la personne l'a demandé, onglet en cours).
+  let saved = null;
+  try { saved = sessionStorage.getItem(KEY_STORAGE); } catch { /* ignoré */ }
+  if (saved && state.model) {
+    state.apiKey = saved;
+    state.remember = true;
+    ui.remember.checked = true;
+    showConnected(true);
+    log("Clé restaurée depuis sessionStorage (cet onglet uniquement).", "info");
+  }
+
+  initFirebase();
+}
+
+init();

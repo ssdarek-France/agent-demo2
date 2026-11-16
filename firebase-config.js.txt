@@ -1,0 +1,27 @@
+/* =====================================================================
+   Configuration Firebase (gabarit à remplir)
+   ---------------------------------------------------------------------
+   Où trouver ces valeurs ?
+   Console Firebase > ⚙ Paramètres du projet > Général > "Vos applications"
+   > application Web (</>) > "Configuration du SDK" > option "Config".
+
+   Ces valeurs sont PUBLIQUES : elles identifient votre projet, elles ne
+   donnent aucun droit à elles seules. La sécurité repose sur
+   firestore.rules et sur l'authentification. Vous pouvez donc publier
+   ce fichier sur GitHub.
+
+   ⚠ À ne pas confondre avec la clé API du fournisseur LLM (Groq, OpenAI...),
+   qui, elle, est SECRÈTE et ne doit jamais apparaître dans ce fichier.
+
+   Tant que les valeurs commencent par "VOTRE_", l'application tourne en
+   mode local : la conversation fonctionne, mais rien n'est archivé.
+   ===================================================================== */
+
+export const firebaseConfig = {
+  apiKey: "VOTRE_API_KEY",
+  authDomain: "VOTRE_PROJET.firebaseapp.com",
+  projectId: "VOTRE_PROJET",
+  storageBucket: "VOTRE_PROJET.appspot.com",
+  messagingSenderId: "VOTRE_SENDER_ID",
+  appId: "VOTRE_APP_ID",
+};
